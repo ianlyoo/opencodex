@@ -1,7 +1,7 @@
 /**
  * `application/vnd.amazon.eventstream` decoder.
  *
- * Ported from jawcode `packages/ai/src/providers/aws-eventstream.ts` (verbatim logic).
+ * Originally ported from jawcode `packages/ai/src/providers/aws-eventstream.ts`.
  * Foundational dependency for AWS-eventstream providers: kiro (CodeWhisperer
  * GenerateAssistantResponse) and amazon-bedrock (Converse). Self-contained — only
  * uses Buffer / DataView / TextDecoder (Bun + Node compatible).
@@ -49,6 +49,22 @@ export function crc32(bytes: Uint8Array, seed = 0): number {
 	return (c ^ 0xffffffff) >>> 0;
 }
 
+function validateMessageLength(total: number): void {
+	if (total < MIN_MESSAGE_LEN) throw new Error(`eventstream: total length ${total} below minimum`);
+	if (total > MAX_MESSAGE_LEN) throw new Error(`eventstream: total length ${total} exceeds maximum`);
+}
+
+/** Validate the prelude before retaining a body, in both buffered and streaming paths. */
+function validatePrelude(bytes: Uint8Array, total: number): number {
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const headersLen = view.getUint32(4, false);
+	const preludeCrc = view.getUint32(8, false);
+	if (crc32(bytes.subarray(0, PRELUDE_LEN)) !== preludeCrc) throw new Error("eventstream: prelude CRC mismatch");
+	if (headersLen > MAX_HEADERS_LEN) throw new Error(`eventstream: headers length ${headersLen} exceeds maximum`);
+	if (headersLen > total - MIN_MESSAGE_LEN) throw new Error("eventstream: headers length exceeds frame payload");
+	return headersLen;
+}
+
 /**
  * Decode a single, fully buffered eventstream message. Throws if the framing is
  * malformed or either CRC mismatches.
@@ -58,13 +74,8 @@ export function decodeMessage(frame: Uint8Array): EventStreamMessage {
 	const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
 	const total = view.getUint32(0, false);
 	if (total !== frame.length) throw new Error(`eventstream: framed length ${total} != buffer ${frame.length}`);
-	if (total > MAX_MESSAGE_LEN) throw new Error(`eventstream: total length ${total} exceeds maximum`);
-	const headersLen = view.getUint32(4, false);
-	const preludeCrc = view.getUint32(8, false);
-	const computedPreludeCrc = crc32(frame.subarray(0, PRELUDE_LEN));
-	if (computedPreludeCrc !== preludeCrc) throw new Error("eventstream: prelude CRC mismatch");
-	if (headersLen > MAX_HEADERS_LEN) throw new Error(`eventstream: headers length ${headersLen} exceeds maximum`);
-	if (headersLen > total - MIN_MESSAGE_LEN) throw new Error("eventstream: headers length exceeds frame payload");
+	validateMessageLength(total);
+	const headersLen = validatePrelude(frame, total);
 	const msgCrc = view.getUint32(total - MESSAGE_CRC_LEN, false);
 	const computedMsgCrc = crc32(frame.subarray(0, total - MESSAGE_CRC_LEN));
 	if (computedMsgCrc !== msgCrc) throw new Error("eventstream: message CRC mismatch");
@@ -171,39 +182,84 @@ function bigIntFromBytes(b: Uint8Array): bigint {
 }
 
 /**
+ * Own at most one incomplete frame. Complete frames remain views into the input;
+ * fragmented frames get one exact-sized allocation after their prelude is valid.
+ * Never reuse an emitted buffer: consumers may retain a message's payload view.
+ */
+class EventStreamFramer {
+	private pending: Uint8Array | undefined;
+	private filled = 0;
+	private total = 0;
+
+	*push(chunk: Uint8Array): Generator<Uint8Array> {
+		let offset = 0;
+		while (offset < chunk.length) {
+			if (!this.pending && chunk.length - offset >= HEADER_BLOCK_OFFSET) {
+				const remaining = chunk.subarray(offset);
+				const total = new DataView(remaining.buffer, remaining.byteOffset, remaining.byteLength).getUint32(0, false);
+				validateMessageLength(total);
+				validatePrelude(remaining, total);
+				if (remaining.length >= total) {
+					offset += total;
+					yield remaining.subarray(0, total);
+					continue;
+				}
+				this.pending = new Uint8Array(total);
+				this.pending.set(remaining);
+				this.filled = remaining.length;
+				this.total = total;
+				return;
+			}
+
+			this.pending ??= new Uint8Array(HEADER_BLOCK_OFFSET);
+			// Check length at four bytes and CRC/header limits at twelve, even when
+			// those boundaries arrive in separate reads. Do not allocate the body early.
+			const target = this.filled < 4 ? 4 : this.filled < HEADER_BLOCK_OFFSET ? HEADER_BLOCK_OFFSET : this.total;
+			const count = Math.min(target - this.filled, chunk.length - offset);
+			this.pending.set(chunk.subarray(offset, offset + count), this.filled);
+			this.filled += count;
+			offset += count;
+			if (this.filled === 4) {
+				this.total = new DataView(this.pending.buffer).getUint32(0, false);
+				validateMessageLength(this.total);
+			}
+			if (this.filled === HEADER_BLOCK_OFFSET) {
+				validatePrelude(this.pending, this.total);
+				const frame = new Uint8Array(this.total);
+				frame.set(this.pending);
+				this.pending = frame;
+			}
+			if (this.filled === this.total) {
+				const frame = this.pending;
+				this.pending = undefined;
+				this.filled = 0;
+				this.total = 0;
+				yield frame;
+			}
+		}
+	}
+
+	finish(): void {
+		if (this.filled > 0) throw new Error("eventstream: truncated message at end of stream");
+	}
+}
+
+/**
  * Async generator that consumes a `ReadableStream<Uint8Array>` (a fetch response
  * body) and yields fully-framed messages, handling arbitrary chunk boundaries.
  */
 export async function* decodeEventStream(source: ReadableStream<Uint8Array>): AsyncGenerator<EventStreamMessage> {
 	const reader = source.getReader();
-	let buf: Uint8Array = new Uint8Array(0);
+	const framer = new EventStreamFramer();
 	try {
 		while (true) {
 			const { value, done } = await reader.read();
-			if (value && value.length > 0) buf = buf.length === 0 ? value : Buffer.concat([buf, value]);
-			let offset = 0;
-			while (buf.length - offset >= 4) {
-				const dv = new DataView(buf.buffer, buf.byteOffset + offset, buf.length - offset);
-				const total = dv.getUint32(0, false);
-				if (total < MIN_MESSAGE_LEN) throw new Error(`eventstream: total length ${total} below minimum`);
-				if (total > MAX_MESSAGE_LEN) throw new Error(`eventstream: total length ${total} exceeds maximum`);
-				if (buf.length - offset >= HEADER_BLOCK_OFFSET) {
-					const headersLen = dv.getUint32(4, false);
-					const preludeCrc = dv.getUint32(8, false);
-					const computedPreludeCrc = crc32(buf.subarray(offset, offset + PRELUDE_LEN));
-					if (computedPreludeCrc !== preludeCrc) throw new Error("eventstream: prelude CRC mismatch");
-					if (headersLen > MAX_HEADERS_LEN) throw new Error(`eventstream: headers length ${headersLen} exceeds maximum`);
-				}
-				if (buf.length - offset < total) break;
-				const frame = buf.subarray(offset, offset + total);
-				yield decodeMessage(frame);
-				offset += total;
+			if (value) {
+				for (const frame of framer.push(value)) yield decodeMessage(frame);
 			}
-			if (offset > 0) buf = buf.slice(offset);
-			if (buf.length > MAX_MESSAGE_LEN) throw new Error(`eventstream: buffered frame exceeds maximum ${MAX_MESSAGE_LEN}`);
 			if (done) break;
 		}
-		if (buf.length > 0) throw new Error("eventstream: truncated message at end of stream");
+		framer.finish();
 	} finally {
 		// Early termination (consumer break/return, turn abort, or an HTTP/2 mid-body reset) can leave
 		// an in-flight `reader.read()` pending when this generator's `finally` runs. Releasing the lock

@@ -210,6 +210,8 @@ of the HTTP retry loop.
   caller expecting JSON would otherwise receive prose.
 - Decodes `application/vnd.amazon.eventstream`, reconstructs text/thinking/tool events, detects
   truncated tool JSON, and estimates usage because the upstream does not return token counts.
+  Frames are limited to 16 MiB with at most 128 KiB of headers. Invalid lengths and prelude
+  checksums are rejected before buffering the body. Decoding failures cancel the response reader.
 - Uses the configured `baseUrl` verbatim when it is custom. A canonical
   `runtime.{region}.kiro.dev` URL follows the imported credential's API region; only that canonical
   shape is eligible for one bounded fallback to `q.{region}.amazonaws.com` after an endpoint,

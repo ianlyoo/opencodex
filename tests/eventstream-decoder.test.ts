@@ -84,6 +84,56 @@ describe("eventstream-decoder", () => {
 		await expect(drain(streamChunks(prelude))).rejects.toThrow(/headers length .* exceeds maximum/);
 	});
 
+	test("impossible header length fails at the prelude and cancels without reading the body", async () => {
+		const prelude = new Uint8Array(12);
+		const view = new DataView(prelude.buffer);
+		view.setUint32(0, 1024, false);
+		view.setUint32(4, 1024, false);
+		view.setUint32(8, crc32(prelude.subarray(0, 8)), false);
+		let pulls = 0;
+		let cancelled = false;
+		const source = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				pulls++;
+				if (pulls === 1) controller.enqueue(prelude);
+				else controller.error(new Error("body must not be read"));
+			},
+			cancel() { cancelled = true; },
+		}, { highWaterMark: 0 });
+		await expect(drain(source)).rejects.toThrow("headers length exceeds frame payload");
+		expect(pulls).toBe(1);
+		expect(cancelled).toBe(true);
+		expect(source.locked).toBe(false);
+	});
+
+	test("retained payloads survive mixed complete and fragmented frames in offset views", async () => {
+		const payloads = ["first", "x".repeat(8192), "last"];
+		const frames = payloads.map(text => encodeMessage({ ":event-type": "fixture" }, enc.encode(text)));
+		const wire = Buffer.concat(frames);
+		const padded = new Uint8Array(wire.length + 10);
+		padded.set(wire, 5);
+		const bytes = padded.subarray(5, -5);
+		for (const chunkSize of [1, 11, 12, 13, 1024, bytes.length]) {
+			const chunks: Uint8Array[] = [];
+			for (let i = 0; i < bytes.length; i += chunkSize) chunks.push(bytes.subarray(i, i + chunkSize));
+			const retained: Uint8Array[] = [];
+			for await (const message of decodeEventStream(streamChunks(...chunks))) retained.push(message.payload);
+			expect(retained.map(payload => dec.decode(payload))).toEqual(payloads);
+		}
+	});
+
+	test("truncated prelude and body release the reader after preceding complete frames", async () => {
+		const first = encodeMessage({}, enc.encode("complete"));
+		const second = encodeMessage({ ":event-type": "partial" }, enc.encode("body"));
+		for (const length of [1, 3, 4, 11, 12, second.length - 1]) {
+			const source = streamChunks(first, new Uint8Array(0), second.subarray(0, length));
+			const messages = decodeEventStream(source);
+			expect(dec.decode((await messages.next()).value!.payload)).toBe("complete");
+			await expect(messages.next()).rejects.toThrow("truncated message at end of stream");
+			expect(source.locked).toBe(false);
+		}
+	});
+
 	test("truncated string header throws controlled header error", () => {
 		const frame = encodeMessage({ "x": "abc" }, enc.encode("body"));
 		const dv = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
